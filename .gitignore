@@ -1,0 +1,10 @@
+# data and results stay local (data: scripts/pack_data.sh -> upload to Drive)
+data/
+runs/
+models/
+laya_data.tar.gz
+*.tar.gz
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/

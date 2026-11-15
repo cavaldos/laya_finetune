@@ -1,0 +1,9 @@
+# Laya fine-tune dependencies (separate from the bot's requirements.txt).
+# Install into the project's venv:
+#   .venv/bin/pip install -r laya_finetune/requirements.txt
+# On Kaggle / a rented GPU server (torch is usually preinstalled there):
+#   pip install -r laya_finetune/requirements.txt
+laya==0.4.32
+torch>=2.2
+numpy>=1.24
+huggingface_hub>=0.20
