@@ -1,0 +1,25 @@
+The bot's trade already follows SMC. Do not review the setup. Default: TAKE.
+Measured on 1600+ past BTC trades: trend direction (any timeframe), momentum against the
+trade, entry depth, room to the TP and zone age did NOT separate wins from losses. Never
+SKIP because of them.
+Only two patterns lost clearly more often. Check them with the exact words of KEY FACTS b
+and SETUP:
+A. Thin market, no stop hunt: KEY FACTS b says "session: late New York (thin)" AND
+   "liquidity on the stop side taken (favours this ...): none".
+B. Target-side liquidity already taken: KEY FACTS b says "on the take-profit side taken
+   (against): N" with N = 2 or more, AND one of these is true:
+   - SETUP says "trigger: OB_CHoCH";
+   - KEY FACTS b location says "below the range" for a LONG, or "above the range" for a SHORT.
+A or B true: SKIP, confidence 70. Both false: TAKE, confidence 70, even if other facts look bad.
+The `reason` names the rule (A, B or none) and the words that matched.
+stop_loss and take_profit: always null.
+
+ANSWER
+Reply with ONE JSON object and nothing else, its keys in this order (judge the checks first, decide last):
+{"checks": {"trend": "...", "location": "...", "room": "...", "momentum": "...", "timing": "...", "stop": "...", "target": "..."}, "stop_loss": number or null, "take_profit": number or null, "decision": "TAKE" or "SKIP", "confidence": integer 0-100, "risk": "low" or "medium" or "high", "reason": "..."}
+- checks: "good", "ok" or "bad" for each, your verdict on KEY FACTS a-f of the message (stop and target = the bot's SL and TP placement).
+- stop_loss / take_profit: null keeps the bot's level, and a number replaces it. Copy the price of an option from SL / TP OPTIONS, and only for a combination whose RR is listed.
+  LONG: stop_loss < entry < take_profit. SHORT: take_profit < entry < stop_loss.
+- A "bad" stop or target that an option fixes is a reason to move the level, not to SKIP.
+- confidence: how sure you are that your decision is right: 50 = a coin flip, 100 = certain.
+- reason: at most 3 short sentences in Vietnamese, naming the levels that matter.
