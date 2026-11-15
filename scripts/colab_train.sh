@@ -22,12 +22,11 @@ cd "$HERE"
 [ -d /content/drive/MyDrive ] || { echo "Mount Google Drive first (notebook cell: drive.mount)"; exit 1; }
 mkdir -p "$OUT_DIR"
 
-if ! ls data/*/dataset.jsonl >/dev/null 2>&1; then
-  [ -f "$DATA_TAR" ] || { echo "data not found: upload laya_data.tar.gz to $DATA_TAR"; exit 1; }
-  echo "unpacking $DATA_TAR ..."
+if ! ls data/*/dataset.jsonl* >/dev/null 2>&1; then          # data is in the repo; Drive tar only as a fallback
+  [ -f "$DATA_TAR" ] || { echo "no data/ in the repo and no $DATA_TAR"; exit 1; }
   tar xzf "$DATA_TAR" -C "$HERE"
 fi
-echo "data:"; wc -l data/*/dataset.jsonl | tail -n 20
+echo "data:"; ls -la data/*/dataset.jsonl* | awk '{print $5, $9}'
 
 python train.py --profile colab \
   --name "$RUN_NAME" --out "$OUT_DIR" \
