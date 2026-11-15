@@ -107,3 +107,31 @@ included) if only the trades the model likes were taken, e.g. `p(win) > 1/(1+RR)
 
 Coin name or not: train once plain and once with `--anonymize`, compare `AUC/coin`. Equal -> keep the
 anonymized model. Plain better only in overall AUC -> it learned per-coin win rates; reject it.
+
+## Price direction task (up / down + how far)
+
+Instead of win / loss of one SMC trade, predict the market: from the price path + indicators up to a
+moment, is the price higher or lower `horizon` candles later, and by how much. Data from Bot_Trade's
+`src/evaluate/price_dataset.py` (text: indicators of the chart TF + 1h + 4h, SMC structure, candles, day
+context, every price as % from the current price, no coin name; ~1.75k tokens, fits `--max-len 2048`;
+`--mode image` / `both` also writes chart PNGs for an image model).
+
+```bash
+bash laya_finetune/scripts/build_price_dataset.sh                 # Mac: every coin -> data_price/<coin>/
+bash laya_finetune/scripts/build_price_dataset.sh BTCUSDT ETHUSDT # only these
+python train.py --data data_price --profile smoke                 # Mac flow check (~2 min)
+DATA_DIR=data_price RUN_NAME=dir1 bash scripts/colab_train.sh     # Kaggle / Colab
+```
+
+Default rows: a 15m chart every 3h, label after 12 candles (3h), so two rows never share a result.
+Each row asks Laya two questions:
+- `direction` (choice up / down) -> p(up);
+- `move` (score, 5 ordered levels; edges = train quantiles of the move in ATR of the chart TF,
+  `--move-unit pct` for raw %) -> expected move in % = sum of p(level) x level median x ATR %.
+
+`--horizon h4` / `h24` relabels with another stored horizon; `--questions direction` trains only the
+direction question (half the items, half the time).
+
+The report compares Laya with `base_rate` and `logistic_features` (logistic regression on the
+indicator numbers of the same text). Laya is only worth something if it beats `logistic_features` on
+log-loss / AUC/coin. The trading block is gross % per trade (fees ~0.08-0.12% per round trip not taken off).

@@ -1,0 +1,13 @@
+{
+  "text_format": "price-v2",
+  "anchors": "grid",
+  "tf": "15m",
+  "every": 12,
+  "horizons": [
+    12,
+    4,
+    24
+  ],
+  "show_symbol": false,
+  "structure": true
+}

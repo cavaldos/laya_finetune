@@ -6,6 +6,7 @@
 #   RUN_NAME=run1 bash scripts/colab_train.sh                       # defaults below
 #   RUN_NAME=anon1 bash scripts/colab_train.sh --anonymize          # extra args go to train.py
 #   RUN_NAME=quick bash scripts/colab_train.sh --limit-train 2000 --epochs 1
+#   DATA_DIR=data_price RUN_NAME=dir1 bash scripts/colab_train.sh  # price direction task (up / down + move)
 #
 # Settings (environment variables):
 DRIVE="${DRIVE:-/content/drive/MyDrive/laya}"                 # your folder on Google Drive
@@ -14,6 +15,7 @@ OUT_DIR="${OUT_DIR:-$DRIVE/runs}"                             # runs (checkpoint
 RUN_NAME="${RUN_NAME:-run1}"
 MAX_HOURS="${MAX_HOURS:-0}"                                   # e.g. 3.5 to stop cleanly before a session limit
 SAVE_EVERY="${SAVE_EVERY:-20}"                                # minutes between resume saves
+DATA_DIR="${DATA_DIR:-data}"                                  # data (win / loss) or data_price (direction)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,13 +24,13 @@ cd "$HERE"
 [ -d /content/drive/MyDrive ] || { echo "Mount Google Drive first (notebook cell: drive.mount)"; exit 1; }
 mkdir -p "$OUT_DIR"
 
-if ! ls data/*/dataset.jsonl* >/dev/null 2>&1; then          # data is in the repo; Drive tar only as a fallback
+if ! ls "$DATA_DIR"/*/dataset.jsonl* >/dev/null 2>&1; then          # data is in the repo; Drive tar only as a fallback
   [ -f "$DATA_TAR" ] || { echo "no data/ in the repo and no $DATA_TAR"; exit 1; }
   tar xzf "$DATA_TAR" -C "$HERE"
 fi
-echo "data:"; ls -la data/*/dataset.jsonl* | awk '{print $5, $9}'
+echo "data:"; ls -la "$DATA_DIR"/*/dataset.jsonl* | awk '{print $5, $9}'
 
-python train.py --profile colab \
+python train.py --profile colab --data "$DATA_DIR" \
   --name "$RUN_NAME" --out "$OUT_DIR" \
   --models-dir /content/laya_models \
   --max-hours "$MAX_HOURS" --save-every-min "$SAVE_EVERY" \

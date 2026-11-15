@@ -83,13 +83,13 @@ def load_rows(path: Path) -> List[dict]:
 
 
 def build_items(tok, rows: Sequence[dict], max_len: int, head_max_len: int, label_smoothing: float = 0.0):
-    """`(items, index)`: one item per usable row and the row index it came from."""
+    """`(items, index)`: one item per usable (row, question) and the row index it came from.
+    A win/loss row has one question; a direction row two (direction + move)."""
     items, index = [], []
     for i, row in enumerate(rows):
         its, _skipped = items_from_rows(tok, [row], max_len, head_max_len, label_smoothing=label_smoothing)
-        if its:
-            items.append(its[0])
-            index.append(i)
+        items += its
+        index += [i] * len(its)
     return items, index
 
 
@@ -115,18 +115,53 @@ def score(model, tok, items, device: torch.device, max_len: int, head_max_len: i
     return out
 
 
-def win_probability(items, logits, temperature: Sequence[float], by_options: Dict[str, float]) -> np.ndarray:
-    p = np.empty(len(items))
-    for j, (item, z) in enumerate(zip(items, logits)):
+POSITIVE = ("win", "up")   # the option whose probability a binary question reports
+
+
+def item_probs(items, logits, temperature: Sequence[float], by_options: Dict[str, float]) -> List[np.ndarray]:
+    """Option probabilities of each item (canonical option order) after temperature scaling."""
+    out = []
+    for item, z in zip(items, logits):
         t = float(by_options.get(temp_bucket(item["qtype"], item["k"]), temperature[item["qtype"]]))
         z = np.asarray(z, dtype=float) / max(t, 1e-4)
         e = np.exp(z - z.max())
-        p[j] = (e / e.sum())[list(item["q"]["crit"].keys()).index("win")]
-    return p
+        out.append(e / e.sum())
+    return out
+
+
+def positive_index(item) -> Optional[int]:
+    crit = item["q"]["crit"]
+    if isinstance(crit, dict):
+        keys = list(crit.keys())
+        for label in POSITIVE:
+            if label in keys:
+                return keys.index(label)
+    return None
+
+
+def win_probability(items, logits, temperature: Sequence[float], by_options: Dict[str, float]) -> np.ndarray:
+    """p(win) / p(up) of binary items."""
+    probs = item_probs(items, logits, temperature, by_options)
+    return np.asarray([p[positive_index(it)] for it, p in zip(items, probs)])
 
 
 def labels_of(items) -> np.ndarray:
-    return np.asarray([1 if it["target"][list(it["q"]["crit"].keys()).index("win")] > 0.5 else 0 for it in items])
+    return np.asarray([1 if it["target"][positive_index(it)] > 0.5 else 0 for it in items])
+
+
+def val_metrics(items, logits, temperature: Sequence[float], by_options: Dict[str, float]) -> dict:
+    """Mean log-loss of the true option over every item (all questions), plus AUC / spread of the
+    binary question (win or up). For a win/loss run this is the binary log-loss, as before."""
+    probs = item_probs(items, logits, temperature, by_options)
+    true = [int(np.argmax(it["target"])) for it in items]
+    ll = float(np.mean([-np.log(max(float(p[t]), mx.EPS)) for p, t in zip(probs, true)]))
+    binary = [j for j, it in enumerate(items) if positive_index(it) is not None]
+    auc, spread = None, 0.0
+    if binary:
+        y = np.asarray([1 if true[j] == positive_index(items[j]) else 0 for j in binary])
+        p = np.asarray([probs[j][positive_index(items[j])] for j in binary])
+        auc, spread = mx.auc(y, p), float(p.max() - p.min())
+    return {"log_loss": round(ll, 4), "auc": None if auc is None else round(auc, 4), "p_spread": round(spread, 4)}
 
 
 def fit_temperature(items, logits) -> dict:
@@ -318,19 +353,17 @@ def train(model_dir: str, run_dir: Path, train_rows: List[dict], val_rows: List[
         entry = {"epoch": epoch + 1, "train_loss": round(epoch_loss / max(1, epoch_n), 4)}
         if val_items:
             logits_val = score(model, tok, val_items, device, s.max_len, s.head_max_len, s.eval_batch, amp)
-            y = labels_of(val_items)
-            raw = mx.prob_metrics(y, win_probability(val_items, logits_val, [1.0, 1.0, 1.0], {}))
+            raw = val_metrics(val_items, logits_val, [1.0, 1.0, 1.0], {})
             # Pick epochs on log-loss AFTER temperature scaling: an over-confident epoch that ranks
             # trades better should not lose to a timid one just because of its scale.
             fitted = fit_temperature(val_items, logits_val)
-            m = mx.prob_metrics(y, win_probability(val_items, logits_val, fitted["temperature"],
-                                                   fitted.get("temperature_by_options") or {}))
+            m = val_metrics(val_items, logits_val, fitted["temperature"], fitted.get("temperature_by_options") or {})
             entry.update(val_log_loss=m["log_loss"], val_log_loss_raw=raw["log_loss"], val_auc=m["auc"],
-                         val_p_spread=raw["p_win_spread"])
+                         val_p_spread=raw["p_spread"])
             better = progress["best_val_log_loss"] is None or m["log_loss"] < progress["best_val_log_loss"]
             auc_txt = "-" if m["auc"] is None else f"{m['auc']:.4f}"
             print(f"== epoch {epoch + 1}: train loss {entry['train_loss']:.4f} | val logloss {m['log_loss']:.4f} "
-                  f"(raw {raw['log_loss']:.4f}) AUC {auc_txt} p-spread {raw['p_win_spread']:.3f}"
+                  f"(raw {raw['log_loss']:.4f}) AUC {auc_txt} p-spread {raw['p_spread']:.3f}"
                   f"{'  (best so far)' if better else ''}", flush=True)
         else:
             better = True
@@ -381,6 +414,35 @@ def train(model_dir: str, run_dir: Path, train_rows: List[dict], val_rows: List[
     print(f"best epoch {progress['best_epoch']}, temperature {[round(t, 3) for t in temperature]}", flush=True)
     del best
     return progress
+
+
+def predict_probs(model_dir: str, rows: List[dict], device_name: str, batch_size: int = 16) -> Dict[str, list]:
+    """{question id: [option probabilities (canonical order) or None, one per row]}, with the
+    checkpoint's temperature. A row laya cannot encode gets None."""
+    device = torch.device(device_name)
+    model, tok, cfg = load_checkpoint(model_dir)
+    model.to(device).eval()
+    max_len, head_max_len = cfg.get("max_len", 512), cfg.get("head_max_len", 192)
+    out: Dict[str, list] = {}
+    qids = sorted({q for r in rows for q in r.get("questions", {})})
+    for qid in qids:
+        single = [{"state": r["state"], "questions": {qid: r["questions"][qid]},
+                   "expected": {qid: r["expected"][qid]}} if qid in r.get("questions", {}) else
+                  {"state": "", "questions": {}} for r in rows]
+        items, index = build_items(tok, single, max_len, head_max_len)
+        logits = score(model, tok, items, device, max_len, head_max_len, batch_size, amp=True)
+        probs = item_probs(items, logits, cfg.get("temperature") or [1.0, 1.0, 1.0],
+                           cfg.get("temperature_by_options") or {})
+        column: list = [None] * len(rows)
+        for i, p in zip(index, probs):
+            column[i] = p
+        out[qid] = column
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+    return out
 
 
 def predict_file(model_dir: str, rows: List[dict], device_name: str, batch_size: int = 16) -> np.ndarray:

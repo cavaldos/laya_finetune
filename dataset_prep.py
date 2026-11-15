@@ -1,6 +1,11 @@
-"""Turn `src/evaluate/llm_dataset.py` output into Laya training rows.
+"""Turn Bot_Trade dataset files into Laya training rows. Two tasks, found from the rows:
 
-Input:  one or more `dataset.jsonl` files (one row per closed backtest trade).
+- winloss:   `src/evaluate/llm_dataset.py` (AI-review text of a backtest trade -> win / loss);
+- direction: `src/evaluate/price_dataset.py` (price + indicators before a moment -> price up / down
+  after the horizon, and how far: two Laya questions per row, `direction` (choice up / down) and
+  `move` (score: MOVE_LEVELS ordered levels of the move, edges = quantiles of the train split)).
+
+Input:  one or more `dataset.jsonl` files (one row per closed backtest trade / per anchor).
 Output: Laya JSONL rows `{state, questions, expected}` + a metadata list used for evaluation.
 
 Steps:
@@ -22,7 +27,7 @@ import math
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -37,10 +42,38 @@ QUESTION = {
     },
 }
 LABELS = ("win", "loss")
+TASK_LABELS = {"winloss": ("win", "loss"), "direction": ("up", "down")}
+
+DIRECTION_QUESTION = {
+    "type": "choice",
+    "instructions": ("This is a chart of a crypto coin up to now. Predict the direction: is the price "
+                     "higher or lower at the end of the horizon written in the text?"),
+    "criteria": {
+        "up": "the price is higher at the end of the horizon",
+        "down": "the price is lower (or the same) at the end of the horizon",
+    },
+}
+MOVE_LEVELS = 5
+
+
+def move_question(edges: Sequence[float], unit: str) -> dict:
+    """Score question: levels of the move after the horizon, from the biggest fall to the biggest rise."""
+    u = "ATR" if unit == "atr" else "%"
+
+    def f(v: float) -> str:
+        return f"{v:+.2f} {u}" if unit == "atr" else f"{v:+.3f}%"
+    levels = [f"falls below {f(edges[0])}"]
+    levels += [f"between {f(a)} and {f(b)}" for a, b in zip(edges[:-1], edges[1:])]
+    levels.append(f"rises above {f(edges[-1])}")
+    what = "in ATR of the chart timeframe" if unit == "atr" else "in % of the current price"
+    return {"type": "score",
+            "instructions": f"How far does the price move until the end of the horizon written in the text ({what})?",
+            "criteria": levels}
 
 # Sections of the review text (the `## NAME` headings written by the live reviewer).
 SECTION_PRESETS = {
     "all": None,
+    "auto": "auto",   # winloss -> compact, direction -> all
     # The summary sections: about 1-2k tokens instead of 6-7k.
     "compact": ["PLAN", "KEY FACTS", "SETUP", "TREND", "STRUCTURE"],
     "facts": ["PLAN", "KEY FACTS", "SETUP"],
@@ -105,9 +138,30 @@ def _open_text(path: Path):
     return open(path, encoding="utf-8")
 
 
-def load_trades(files: Sequence[Path], symbols: Optional[Sequence[str]] = None) -> List[Trade]:
+def row_task(row: dict) -> str:
+    return "direction" if row.get("task") == "direction" else "winloss"
+
+
+def with_horizon(row: dict, horizon: Optional[str]) -> dict:
+    """A direction row relabelled with another stored horizon (`targets` key, e.g. "h4")."""
+    if not horizon or row_task(row) != "direction":
+        return row
+    target = (row.get("targets") or {}).get(horizon)
+    if target is None:
+        raise KeyError(f"horizon {horizon} not in the dataset (has {sorted(row.get('targets') or {})})")
+    row = dict(row, ret_pct=target["ret_pct"], max_up_pct=target["max_up_pct"],
+               max_down_pct=target["max_down_pct"], horizon_bars=target["bars"],
+               label="up" if target["ret_pct"] > 0 else "down")
+    end = _ts(row["entry_time"]) + timedelta(minutes=int(target["minutes"]))
+    row["exit_time"] = end.strftime("%Y-%m-%d %H:%M:%S")
+    return row
+
+
+def load_trades(files: Sequence[Path], symbols: Optional[Sequence[str]] = None,
+                horizon: Optional[str] = None) -> List[Trade]:
+    """Rows of every file (all of one task: a win/loss and a direction dataset cannot be mixed)."""
     wanted = {s.upper() for s in symbols} if symbols else None
-    trades, seen = [], set()
+    trades, seen, tasks = [], set(), set()
     for f in files:
         with _open_text(f) as fh:
             for line in fh:
@@ -115,14 +169,19 @@ def load_trades(files: Sequence[Path], symbols: Optional[Sequence[str]] = None) 
                 if not line:
                     continue
                 row = json.loads(line)
-                if row.get("label") not in LABELS or not row.get("text"):
+                task = row_task(row)
+                if row.get("label") not in TASK_LABELS[task] or not row.get("text"):
                     continue
+                row = with_horizon(row, horizon)
+                tasks.add(task)
                 if wanted and _base(row["symbol"]) not in wanted and row["symbol"].upper() not in wanted:
                     continue
                 if row["id"] in seen:        # same trade exported twice
                     continue
                 seen.add(row["id"])
                 trades.append(Trade(row=row))
+    if len(tasks) > 1:
+        raise ValueError("win/loss and direction datasets mixed in one --data folder: point --data at one kind")
     trades.sort(key=lambda t: (t.entry_time, t.row["symbol"]))
     return trades
 
@@ -163,7 +222,7 @@ def sample(trades: List[Trade], n: Optional[int], seed: int) -> List[Trade]:
     if not n or n >= len(trades):
         return trades
     rng = random.Random(seed)
-    by_label = {lab: [t for t in trades if t.row["label"] == lab] for lab in LABELS}
+    by_label = {lab: [t for t in trades if t.row["label"] == lab] for lab in sorted({t.row["label"] for t in trades})}
     picked = []
     for lab, group in by_label.items():
         k = round(n * len(group) / len(trades))
@@ -268,9 +327,46 @@ META_FIELDS = ("id", "symbol", "side", "signal_tf", "entry_time", "exit_time", "
                "zone_type", "sl_source", "tp_source")
 
 
-def to_laya_row(trade: Trade) -> dict:
-    return {"state": trade.text, "questions": {QUESTION_ID: QUESTION},
-            "expected": {QUESTION_ID: trade.row["label"]}}
+DIRECTION_META = ("id", "symbol", "timeframe", "side", "anchor", "entry_time", "exit_time", "label", "ret_pct",
+                  "max_up_pct", "max_down_pct", "atr_pct", "horizon_bars", "features")
+
+
+def to_laya_row(trade: Trade, move: Optional[dict] = None, questions: Sequence[str] = ("direction", "move")) -> dict:
+    if row_task(trade.row) == "winloss":
+        return {"state": trade.text, "questions": {QUESTION_ID: QUESTION},
+                "expected": {QUESTION_ID: trade.row["label"]}}
+    qs, expected = {}, {}
+    if "direction" in questions:
+        qs["direction"], expected["direction"] = DIRECTION_QUESTION, trade.row["label"]
+    if "move" in questions and move is not None:
+        qs["move"], expected["move"] = move["question"], trade.meta["move_level"]
+    return {"state": trade.text, "questions": qs, "expected": expected}
+
+
+def move_value(row: dict, unit: str) -> float:
+    """The move the `move` question is about: % change, or % change / ATR % of the chart timeframe."""
+    ret = float(row["ret_pct"])
+    if unit == "atr":
+        atr = float(row.get("atr_pct") or 0.0)
+        return ret / atr if atr > 0 else 0.0
+    return ret
+
+
+def move_scale(train: Sequence[Trade], unit: str, levels: int = MOVE_LEVELS) -> dict:
+    """Level edges = quantiles of the train moves (every level about as frequent), level medians."""
+    import numpy as np
+
+    values = np.asarray([move_value(t.row, unit) for t in train], dtype=float)
+    edges = [float(np.quantile(values, k / levels)) for k in range(1, levels)]
+    level_of = np.searchsorted(edges, values, side="right")
+    medians = [float(np.median(values[level_of == k])) if (level_of == k).any() else 0.0 for k in range(levels)]
+    return {"unit": unit, "edges": [round(e, 4) for e in edges], "medians": [round(m, 4) for m in medians],
+            "question": move_question(edges, unit)}
+
+
+def move_level(value: float, edges: Sequence[float]) -> int:
+    import bisect
+    return bisect.bisect_right(list(edges), value)
 
 
 def write_jsonl(path: Path, rows: Sequence[dict]) -> None:
@@ -291,27 +387,41 @@ def read_jsonl(path: Path) -> List[dict]:
 def prepare(data: Path, out_dir: Path, *, test_frac: float, val_frac: float,
             sections: Optional[Sequence[str]], anon: bool, group: bool,
             symbols: Optional[Sequence[str]] = None, limits: Optional[Dict[str, Optional[int]]] = None,
-            embargo: bool = True, seed: int = 0) -> dict:
+            embargo: bool = True, seed: int = 0, horizon: Optional[str] = None, move_unit: str = "atr",
+            questions: Sequence[str] = ("direction", "move")) -> dict:
     """Write `<split>.jsonl` (Laya rows) and `<split>_meta.jsonl` (trade info) for train / val / test."""
     files = find_dataset_files(data)
-    trades = load_trades(files, symbols)
+    trades = load_trades(files, symbols, horizon)
+    task = row_task(trades[0].row) if trades else "winloss"
+    if sections == "auto":
+        sections = SECTION_PRESETS["compact"] if task == "winloss" else None
     if len(trades) < 6:
         raise ValueError(f"only {len(trades)} usable trades in {data}")
     train, val, test, info = chrono_split(trades, test_frac, val_frac, embargo)
     limits = limits or {}
     splits = {name: sample(group_, limits.get(name), seed + i)
               for i, (name, group_) in enumerate(zip(SPLITS, (train, val, test)))}
+    move = move_scale(train, move_unit) if task == "direction" and "move" in questions else None
+    if task == "direction" and (anon or group):
+        print("note: --anonymize / --coin-group do nothing on a direction dataset (its text has no prices or coin)")
+        anon = group = False
     for group_ in splits.values():
         for t in group_:
             t.text = build_text(t, sections, anon, group)
-            t.meta = {k: t.row.get(k) for k in META_FIELDS}
+            if task == "winloss":
+                t.meta = {k: t.row.get(k) for k in META_FIELDS}
+            else:
+                t.meta = {k: t.row.get(k) for k in DIRECTION_META}
+                if move is not None:
+                    t.meta["move_value"] = round(move_value(t.row, move_unit), 4)
+                    t.meta["move_level"] = move_level(t.meta["move_value"], move["edges"])
     for name, group_ in splits.items():
-        write_jsonl(out_dir / f"{name}.jsonl", [to_laya_row(t) for t in group_])
+        write_jsonl(out_dir / f"{name}.jsonl", [to_laya_row(t, move, questions) for t in group_])
         write_jsonl(out_dir / f"{name}_meta.jsonl", [t.meta for t in group_])
 
     def stats(group_: List[Trade]) -> dict:
         n = len(group_)
-        wins = sum(t.row["label"] == "win" for t in group_)
+        wins = sum(t.row["label"] in ("win", "up") for t in group_)
         by_sym: Dict[str, int] = {}
         for t in group_:
             by_sym[t.row["symbol"]] = by_sym.get(t.row["symbol"], 0) + 1
@@ -320,6 +430,7 @@ def prepare(data: Path, out_dir: Path, *, test_frac: float, val_frac: float,
                 "to": str(group_[-1].entry_time) if n else None, "by_symbol": by_sym}
 
     everything = [t for g in splits.values() for t in g]
-    return {"files": [str(f) for f in files], "total_trades": len(trades), **info,
+    return {"files": [str(f) for f in files], "total_trades": len(trades), "task": task, "horizon": horizon,
+            "move": {k: v for k, v in move.items() if k != "question"} if move else None, **info,
             **{name: stats(g) for name, g in splits.items()},
             "chars_median": sorted(len(t.text) for t in everything)[len(everything) // 2]}

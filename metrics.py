@@ -192,3 +192,157 @@ def logistic_baseline(train_meta: List[dict], test_meta: List[dict], use_symbol:
         w -= lr * (x_tr.T @ g / n + l2 * w / n)
         b -= lr * g.mean()
     return 1 / (1 + np.exp(-np.clip(x_te @ w + b, -30, 30)))
+
+
+# ------------------------------------------------------------------------- direction task
+# Rows of src/evaluate/price_dataset.py: p(up) for the direction question, a probability per move
+# level for the move question. The report compares Laya with the base rate and with a logistic
+# regression on the numbers of the text (row "features"): a text model that does not beat that
+# baseline learned nothing the indicators did not already say.
+
+def _fit_logistic(x_tr: np.ndarray, y: np.ndarray, x_te: np.ndarray, l2: float = 1.0, iters: int = 2000,
+                  lr: float = 0.1) -> np.ndarray:
+    mu, sd = x_tr.mean(0), x_tr.std(0) + 1e-9
+    x_tr, x_te = (x_tr - mu) / sd, (x_te - mu) / sd
+    w, b = np.zeros(x_tr.shape[1]), math.log((y.mean() + EPS) / (1 - y.mean() + EPS))
+    n = len(y)
+    for _ in range(iters):
+        z = np.clip(x_tr @ w + b, -30, 30)
+        g = 1 / (1 + np.exp(-z)) - y
+        w -= lr * (x_tr.T @ g / n + l2 * w / n)
+        b -= lr * g.mean()
+    return 1 / (1 + np.exp(-np.clip(x_te @ w + b, -30, 30)))
+
+
+def feature_matrix(meta: List[dict], keys: Optional[List[str]] = None, fill: Optional[np.ndarray] = None):
+    """Numeric `features` of each row; a missing value -> the train median."""
+    if keys is None:
+        keys = sorted({k for m in meta for k, v in (m.get("features") or {}).items() if isinstance(v, (int, float))})
+    x = np.asarray([[float((m.get("features") or {}).get(k)) if (m.get("features") or {}).get(k) is not None
+                     else np.nan for k in keys] for m in meta], dtype=float)
+    if fill is None:
+        fill = np.nanmedian(x, axis=0) if len(x) else np.zeros(len(keys))
+        fill = np.where(np.isnan(fill), 0.0, fill)
+    x = np.where(np.isnan(x), fill, x)
+    return x, keys, fill
+
+
+def logistic_features(train_meta: List[dict], test_meta: List[dict]) -> np.ndarray:
+    """p(up) from an L2 logistic regression on the indicator numbers of the text."""
+    x_tr, keys, fill = feature_matrix(train_meta)
+    x_te, _, _ = feature_matrix(test_meta, keys, fill)
+    y = np.asarray([1.0 if m["label"] == "up" else 0.0 for m in train_meta])
+    return _fit_logistic(x_tr, y, x_te)
+
+
+def rps(probs: np.ndarray, levels: np.ndarray) -> float:
+    """Ranked probability score of ordered levels (0 = perfect; lower is better)."""
+    k = probs.shape[1]
+    target = np.eye(k)[levels]
+    return float(np.mean(np.sum((np.cumsum(probs, 1) - np.cumsum(target, 1)) ** 2, 1) / (k - 1)))
+
+
+def _corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
+    if len(a) < 3 or a.std() == 0 or b.std() == 0:
+        return None
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _rank(a: np.ndarray) -> np.ndarray:
+    order = np.argsort(a, kind="mergesort")
+    r = np.empty(len(a))
+    r[order] = np.arange(len(a))
+    return r
+
+
+def direction_trading(p_up: np.ndarray, ret: np.ndarray) -> Dict[str, dict]:
+    """Gross % per trade (fees NOT included) if one followed the model: long when p(up) > 0.5,
+    short otherwise; also only the most confident part of the rows."""
+    side = np.where(p_up > 0.5, 1.0, -1.0)
+    pnl = side * ret
+    conf = np.abs(p_up - 0.5)
+    order = np.argsort(-conf, kind="mergesort")
+
+    def block(mask):
+        n = int(mask.sum())
+        if n == 0:
+            return {"n": 0, "hit": None, "mean_pct": None, "sum_pct": 0.0}
+        return {"n": n, "hit": round(float((pnl[mask] > 0).mean()), 4), "mean_pct": round(float(pnl[mask].mean()), 4),
+                "sum_pct": round(float(pnl[mask].sum()), 2)}
+
+    out = {"all": block(np.ones(len(p_up), dtype=bool))}
+    for share in (0.5, 0.2, 0.1):
+        mask = np.zeros(len(p_up), dtype=bool)
+        mask[order[: max(1, int(len(p_up) * share))]] = True
+        out[f"top{int(share * 100)}"] = block(mask)
+    out["always_long"] = {"n": len(ret), "hit": round(float((ret > 0).mean()), 4) if len(ret) else None,
+                          "mean_pct": round(float(ret.mean()), 4) if len(ret) else None,
+                          "sum_pct": round(float(ret.sum()), 2)}
+    return out
+
+
+def direction_report(y: np.ndarray, p_up: np.ndarray, ret: np.ndarray, symbols: Sequence[str]) -> dict:
+    per_sym = per_symbol_auc(y, p_up, symbols)
+    return {**prob_metrics(y, p_up), "within_symbol_auc": within_symbol_auc(per_sym), "per_symbol": per_sym,
+            "trading": direction_trading(p_up, ret)}
+
+
+def move_report(probs: np.ndarray, levels: np.ndarray, medians: Sequence[float], value: np.ndarray,
+                atr: np.ndarray, unit: str, ret: np.ndarray) -> dict:
+    """The move question: RPS, level accuracy, expected move vs the real one (correlation, MAE in %)."""
+    expected = probs @ np.asarray(medians, dtype=float)                  # in the question's unit
+    expected_pct = expected * atr if unit == "atr" else expected
+    return {
+        "rps": round(rps(probs, levels), 4),
+        "level_accuracy": round(float((probs.argmax(1) == levels).mean()), 4),
+        "pearson_expected_vs_real": None if _corr(expected, value) is None else round(_corr(expected, value), 4),
+        "spearman_expected_vs_real": None if _corr(_rank(expected), _rank(value)) is None
+        else round(_corr(_rank(expected), _rank(value)), 4),
+        "mae_pct": round(float(np.mean(np.abs(expected_pct - ret))), 4),
+        "expected_pct_spread": round(float(expected_pct.max() - expected_pct.min()), 4) if len(expected_pct) else 0.0,
+    }
+
+
+def format_direction_report(report: dict) -> str:
+    models, move = report["models"], report.get("move")
+    lines = ["", "=" * 84,
+             "TEST RESULT: %d rows, up %.1f%% (train up %.1f%%), horizon %s, |move| median %.3f%%"
+             % (report["test_n"], 100 * report["test_up_rate"], 100 * report["train_up_rate"],
+                report.get("horizon") or "main", report["abs_move_median_pct"]),
+             "=" * 84, "DIRECTION (up / down)",
+             "%-20s %8s %8s %8s %10s %8s %9s" % ("model", "logloss", "brier", "AUC", "AUC/coin", "acc", "p spread")]
+    for name, m in models.items():
+        lines.append("%-20s %8s %8s %8s %10s %8s %9s" % (
+            name, _f(m["log_loss"]), _f(m["brier"]), _f(m["auc"]), _f(m["within_symbol_auc"]),
+            _f(m["accuracy@0.5"]), _f(m["p_win_spread"])))
+    lines += ["  logloss / brier lower than base_rate = better; AUC 0.5 = no skill. logistic_features = the",
+              "  indicator numbers of the text in a logistic regression: Laya must beat it to have read more."]
+    best = models.get("laya_finetuned")
+    if best is not None and best["p_win_spread"] < 0.02:
+        lines += ["  WARNING: laya_finetuned gives (almost) the same p(up) to every row: it collapsed to one answer."]
+    if move:
+        lines += ["", "MOVE (%d levels in %s, edges %s)" % (len(move["medians"]), move["unit"], move["edges"]),
+                  "%-20s %8s %8s %10s %10s %9s %9s" % ("model", "RPS", "lvl acc", "pearson", "spearman", "MAE %",
+                                                        "spread %")]
+        for name, m in move["models"].items():
+            lines.append("%-20s %8s %8s %10s %10s %9s %9s" % (
+                name, _f(m["rps"]), _f(m["level_accuracy"]), _f(m["pearson_expected_vs_real"]),
+                _f(m["spearman_expected_vs_real"]), _f(m["mae_pct"]), _f(m["expected_pct_spread"])))
+        lines += ["  climatology = always the train level shares. RPS lower = better; correlation of the expected",
+                  "  move with the real one > 0 = it knows bigger from smaller moves (and their side)."]
+    if best is not None:
+        lines += ["", "Following laya_finetuned (long if p(up) > 0.5 else short), gross % per trade, fees NOT included",
+                  "(a round trip costs ~0.08-0.12%%):".replace("%%", "%"),
+                  "  %-26s %6s %8s %10s %9s" % ("", "rows", "hit %", "mean %", "sum %")]
+        names = {"all": "every row", "top50": "50% most confident", "top20": "20% most confident",
+                 "top10": "10% most confident", "always_long": "always long (reference)"}
+        for key, label in names.items():
+            t = best["trading"][key]
+            hit = None if t["hit"] is None else 100 * t["hit"]
+            lines.append("  %-26s %6d %8s %10s %9s" % (label, t["n"], _f(hit, "%.1f"), _f(t["mean_pct"], "%+.4f"),
+                                                       _f(t["sum_pct"], "%+.2f")))
+        lines += ["", "Per coin (laya_finetuned):"]
+        for s, v in best["per_symbol"].items():
+            lines.append("  %-12s n=%-5d up %5.1f%%  AUC %s" % (s, v["n"], 100 * v["win_rate"], _f(v["auc"])))
+    lines += ["=" * 84, ""]
+    return "\n".join(lines)
